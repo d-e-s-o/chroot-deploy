@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Daniel Mueller <deso@posteo.net>
+// Copyright (C) 2023-2024 Daniel Mueller <deso@posteo.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #![allow(clippy::let_and_return, clippy::let_unit_value)]
@@ -57,6 +57,27 @@ use xz2::read::XzDecoder;
 use crate::args::Args;
 use crate::args::Command;
 use crate::args::Deploy;
+
+
+/// Extract the file stem of a path.
+///
+/// Contrary to `Path::file_stem`, this function return the file name
+/// part before *any* extensions, not just the last one.
+fn file_stem(path: &Path) -> Result<&OsStr> {
+  let mut last_stem = path.as_os_str();
+
+  loop {
+    let stem = Path::new(last_stem)
+      .file_stem()
+      .with_context(|| format!("failed to extract file stem of path `{}`", path.display()))?;
+
+    if stem == last_stem {
+      break Ok(stem)
+    }
+
+    last_stem = stem;
+  }
+}
 
 
 #[derive(Debug)]
@@ -538,13 +559,7 @@ async fn deploy(deploy: Deploy) -> Result<()> {
   } = deploy;
 
   let tmp = temp_dir();
-  let file = archive.file_name().with_context(|| {
-    format!(
-      "failed to extract file name of path `{}`",
-      archive.display()
-    )
-  })?;
-  let stem = archive.file_stem().with_context(|| {
+  let stem = file_stem(&archive).with_context(|| {
     format!(
       "failed to extract file stem of path `{}`",
       archive.display()
@@ -552,7 +567,7 @@ async fn deploy(deploy: Deploy) -> Result<()> {
   })?;
 
   let chroot_dir = tmp.join(stem);
-  let ref_path = tmp.join(file).with_extension("lck");
+  let ref_path = tmp.join(stem).with_extension("lck");
 
   let setup = || setup_chroot(&archive, &chroot_dir);
   let chroot = || chroot(&chroot_dir, command.as_deref(), user.as_deref());
@@ -598,6 +613,14 @@ mod tests {
 
   use tokio::select;
 
+
+  /// Check that we can extract a file's stem properly.
+  #[test]
+  fn file_stem_extraction() {
+    let path = Path::new("/tmp/stage3-amd64-openrc-20240211T161834Z.tar.xz");
+    let stem = file_stem(path).unwrap();
+    assert_eq!(stem, OsStr::new("stage3-amd64-openrc-20240211T161834Z"));
+  }
 
   /// Check that we can increment the reference count of a file.
   #[tokio::test]

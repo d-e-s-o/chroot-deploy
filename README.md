@@ -4,5 +4,7 @@
 chroot-deploy
 =============
 
+- [Changelog](CHANGELOG.md)
+
 A program able to deploy and work with a chroot environment in a quick
 manner.
