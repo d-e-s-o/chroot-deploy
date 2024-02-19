@@ -540,8 +540,15 @@ async fn cleanup_chroot(chroot: &Path, remove: bool) -> Result<()> {
     ],
   );
 
-  let results = <[_; 6]>::from(join!(proc, dev, sys, repos, tmp, run));
-  let () = results.into_iter().try_for_each(|result| result)?;
+  let results = join!(dev, sys, repos, tmp, run);
+  // There exists some kind of a dependency causing the `proc` unmount
+  // to occasionally fail when run in parallel to the others. So make
+  // sure to run it strictly afterwards.
+  let result = proc.await;
+  let () = <[_; 5]>::from(results)
+    .into_iter()
+    .chain([result])
+    .try_for_each(|result| result)?;
 
   if remove {
     let () = remove_dir_all(chroot).await?;
