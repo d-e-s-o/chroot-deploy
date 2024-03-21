@@ -1,9 +1,27 @@
 [package]
 name = "chroot-deploy"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
+homepage = "https://github.com/d-e-s-o/chroot-deploy"
+repository = "https://github.com/d-e-s-o/chroot-deploy.git"
 readme = "README.md"
+categories = [
+  "accessibility",
+  "api-bindings",
+  "asynchronous",
+  "command-line-utilities",
+  "os::unix-apis"
+]
+keywords = [
+  "async",
+  "chroot",
+  "linux",
+]
+description = """
+A program able to deploy and work with a chroot environment in a quick
+manner.
+"""
 default-run = "chroot-deploy"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
