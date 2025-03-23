@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2024 Daniel Mueller <deso@posteo.net>
+// Copyright (C) 2023-2025 Daniel Mueller <deso@posteo.net>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #![allow(clippy::let_and_return, clippy::let_unit_value)]
@@ -33,7 +33,6 @@ use clap::Parser as _;
 use futures_util::join;
 use futures_util::TryFutureExt as _;
 
-use fs4::lock_contended_error;
 use fs4::tokio::AsyncFileExt as _;
 
 use tar::Archive;
@@ -88,23 +87,16 @@ struct FileLockGuard<'file> {
 
 impl<'file> FileLockGuard<'file> {
   async fn lock(file: &'file mut File) -> Result<Self> {
-    let locked_err = lock_contended_error();
     loop {
       // Really the freakin' `lock_exclusive` API should be returning a
       // future, but that seems to be too much to ask and so we roll our
       // own poor man's future here by trying and retrying after a delay.
-      match file.try_lock_exclusive() {
-        Ok(()) => {
-          let slf = Self { file: Some(file) };
-          break Ok(slf)
-        },
-        Err(err) => {
-          if err.kind() == locked_err.kind() {
-            let () = sleep(Duration::from_millis(100)).await;
-          } else {
-            break Err(err).context("failed to lock file")
-          }
-        },
+      let locked = file.try_lock_exclusive().context("failed to lock file")?;
+      if locked {
+        let slf = Self { file: Some(file) };
+        break Ok(slf)
+      } else {
+        let () = sleep(Duration::from_millis(100)).await;
       }
     }
   }
