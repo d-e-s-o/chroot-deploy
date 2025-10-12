@@ -332,13 +332,10 @@ where
       String::new()
     };
 
-    Err(io::Error::new(
-      io::ErrorKind::Other,
-      format!(
-        "`{}` reported non-zero exit-status{code}{stderr}",
-        format_command(command, args)
-      ),
-    ))
+    Err(io::Error::other(format!(
+      "`{}` reported non-zero exit-status{code}{stderr}",
+      format_command(command, args)
+    )))
   } else {
     Ok(())
   }
@@ -361,13 +358,10 @@ where
     .output()
     .await
     .map_err(|err| {
-      io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-          "failed to run `{}`: {err}",
-          format_command(command.as_ref(), args.clone())
-        ),
-      )
+      io::Error::other(format!(
+        "failed to run `{}`: {err}",
+        format_command(command.as_ref(), args.clone())
+      ))
     })?;
 
   let () = evaluate(output.status, command, args, Some(&output.stderr))?;
@@ -391,13 +385,10 @@ where
     .status()
     .await
     .map_err(|err| {
-      io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-          "failed to run `{}`: {err}",
-          format_command(command.as_ref(), args.clone())
-        ),
-      )
+      io::Error::other(format!(
+        "failed to run `{}`: {err}",
+        format_command(command.as_ref(), args.clone())
+      ))
     })?;
 
   let () = evaluate(status, command, args, None)?;
