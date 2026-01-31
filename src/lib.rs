@@ -8,6 +8,7 @@ mod args;
 
 use std::env;
 use std::env::temp_dir;
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -20,6 +21,7 @@ use std::ops::DerefMut;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::ptr;
 use std::str;
 use std::str::FromStr as _;
 use std::time::Duration;
@@ -205,7 +207,7 @@ async fn with_ref<S, FutS, B, FutB, C, FutC>(
 where
   S: FnOnce() -> FutS,
   FutS: Future<Output = Result<()>>,
-  B: FnOnce() -> FutB,
+  B: FnOnce(bool) -> FutB,
   FutB: Future<Output = Result<()>>,
   C: FnOnce() -> FutC,
   FutC: Future<Output = Result<()>>,
@@ -220,7 +222,8 @@ where
     .with_context(|| format!("failed to open `{}`", ref_path.display()))?;
 
   let guard = inc_ref_cnt(&mut ref_file).await?;
-  if guard.is_some() {
+  let is_first_user = guard.is_some();
+  if is_first_user {
     let setup_result = setup().await;
     let () = drop(guard);
 
@@ -242,7 +245,7 @@ where
   }
 
 
-  let body_result = body().await;
+  let body_result = body(is_first_user).await;
   let result = match dec_ref_cnt(&mut ref_file).await {
     Ok(Some(guard)) => {
       let cleanup_result = cleanup().await;
@@ -406,7 +409,78 @@ where
 }
 
 
-async fn setup_chroot(archive: &Path, chroot: &Path) -> Result<()> {
+/// Create a new mount namespace for the current process.
+///
+/// This function calls `unshare(CLONE_NEWNS)` to create a new mount
+/// namespace and sets the root mount propagation to private to prevent
+/// mount events from leaking to the host.
+fn create_namespace() -> Result<()> {
+  // Create new mount namespace (process-wide).
+  let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+  if rc != 0 {
+    return Err(io::Error::last_os_error()).context("failed to create mount namespace");
+  }
+
+  // Set propagation to private (prevent mount events leaking to host)
+  let rc = unsafe {
+    libc::mount(
+      ptr::null(),
+      c"/".as_ptr(),
+      ptr::null(),
+      libc::MS_REC | libc::MS_PRIVATE,
+      ptr::null(),
+    )
+  };
+  if rc != 0 {
+    return Err(io::Error::last_os_error()).context("failed to set mount propagation to private");
+  }
+
+  Ok(())
+}
+
+
+/// Write the current process's PID to a file for namespace sharing.
+///
+/// This allows subsequent processes to join the namespace using
+/// `nsenter --target <pid> --mount`.
+async fn write_namespace_pid(ns_path: &Path) -> Result<()> {
+  let pid = std::process::id();
+  let mut file = File::create(ns_path).await.with_context(|| {
+    format!(
+      "failed to create namespace PID file `{}`",
+      ns_path.display()
+    )
+  })?;
+  file
+    .write_all(pid.to_string().as_bytes())
+    .await
+    .context("failed to write namespace PID")?;
+  Ok(())
+}
+
+
+/// Read the namespace owner's PID from a file.
+async fn read_namespace_pid(ns_path: &Path) -> Result<u32> {
+  let mut file = File::open(ns_path)
+    .await
+    .with_context(|| format!("failed to open namespace PID file `{}`", ns_path.display()))?;
+  let mut contents = String::new();
+  file
+    .read_to_string(&mut contents)
+    .await
+    .context("failed to read namespace PID")?;
+  contents
+    .trim()
+    .parse()
+    .context("namespace PID file does not contain a valid PID")
+}
+
+
+async fn setup_chroot(archive: &Path, chroot: &Path, ns_path: &Path) -> Result<()> {
+  // Create mount namespace and write our PID for other processes to join.
+  let () = create_namespace()?;
+  let () = write_namespace_pid(ns_path).await?;
+
   let present = try_exists(chroot)
     .await
     .with_context(|| format!("failed to check existence of `{}`", chroot.display()))?;
@@ -480,15 +554,21 @@ async fn setup_chroot(archive: &Path, chroot: &Path) -> Result<()> {
   Ok(())
 }
 
-async fn chroot(chroot: &Path, command: Option<&[OsString]>, user: Option<&OsStr>) -> Result<()> {
-  let args = [
+async fn chroot(
+  chroot_dir: &Path,
+  ns_path: &Path,
+  is_first_user: bool,
+  command: Option<&[OsString]>,
+  user: Option<&OsStr>,
+) -> Result<()> {
+  let su_args = [
     OsStr::new("/bin/su"),
     OsStr::new("--login"),
     user.unwrap_or_else(|| OsStr::new("root")),
   ];
-  let args = args.as_slice();
+  let su_args = su_args.as_slice();
 
-  let command = if let Some(command) = command {
+  let session_command = if let Some(command) = command {
     let mut iter = command.iter();
     format_command(iter.next().context("no command given")?, iter)
   } else {
@@ -501,19 +581,56 @@ async fn chroot(chroot: &Path, command: Option<&[OsString]>, user: Option<&OsStr
     format_command("/bin/env", args)
   };
 
-  let () = check_command(
-    "chroot",
-    [chroot.as_os_str()]
-      .as_slice()
-      .iter()
-      .chain(args)
-      .chain([OsStr::new("--session-command"), OsStr::new(&command)].as_slice()),
-  )
-  .await?;
+  if is_first_user {
+    // Already in namespace from setup phase, run `chroot` directly.
+    let () = check_command(
+      "chroot",
+      [chroot_dir.as_os_str()]
+        .as_slice()
+        .iter()
+        .chain(su_args)
+        .chain(
+          [
+            OsStr::new("--session-command"),
+            OsStr::new(&session_command),
+          ]
+          .as_slice(),
+        ),
+    )
+    .await?;
+  } else {
+    // Join namespace of the first process using `nsenter --target <pid> --mount`.
+    let ns_pid = read_namespace_pid(ns_path).await?;
+    let target_arg = format!("--target={ns_pid}");
+    let chroot_cmd = concat_command(
+      "chroot",
+      [chroot_dir.as_os_str()]
+        .as_slice()
+        .iter()
+        .chain(su_args)
+        .chain(
+          [
+            OsStr::new("--session-command"),
+            OsStr::new(&session_command),
+          ]
+          .as_slice(),
+        ),
+    );
+
+    let () = check_command(
+      "nsenter",
+      [
+        OsStr::new(&target_arg),
+        OsStr::new("--mount"),
+        OsStr::new(&chroot_cmd),
+      ],
+    )
+    .await?;
+  }
   Ok(())
 }
 
-async fn cleanup_chroot(chroot: &Path, remove: bool) -> Result<()> {
+async fn cleanup_chroot(chroot: &Path, ns_path: &Path, remove: bool) -> Result<()> {
   let run = run_command("umount", [chroot.join("run")]);
   let tmp = run_command("umount", [chroot.join("tmp")]);
   let repos = run_command("umount", [chroot.join("var").join("db").join("repos")]);
@@ -543,6 +660,14 @@ async fn cleanup_chroot(chroot: &Path, remove: bool) -> Result<()> {
     .chain([result])
     .try_for_each(|result| result)?;
 
+  // Remove namespace PID file.
+  let () = remove_file(ns_path).await.with_context(|| {
+    format!(
+      "failed to remove namespace PID file `{}`",
+      ns_path.display()
+    )
+  })?;
+
   if remove {
     let () = remove_dir_all(chroot).await?;
   }
@@ -568,10 +693,19 @@ async fn deploy(deploy: Deploy) -> Result<()> {
 
   let chroot_dir = tmp.join(stem);
   let ref_path = tmp.join(stem).with_extension("lck");
+  let ns_path = tmp.join(stem).with_extension("ns");
 
-  let setup = || setup_chroot(&archive, &chroot_dir);
-  let chroot = || chroot(&chroot_dir, command.as_deref(), user.as_deref());
-  let cleanup = || cleanup_chroot(&chroot_dir, remove);
+  let setup = || setup_chroot(&archive, &chroot_dir, &ns_path);
+  let chroot = |is_first_user| {
+    chroot(
+      &chroot_dir,
+      &ns_path,
+      is_first_user,
+      command.as_deref(),
+      user.as_deref(),
+    )
+  };
+  let cleanup = || cleanup_chroot(&chroot_dir, &ns_path, remove);
 
   with_ref(&ref_path, setup, chroot, cleanup).await
 }
@@ -704,7 +838,7 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Err(anyhow!("setup fail")) };
-    let body = || async { unreachable!() };
+    let body = |_is_first_user| async { unreachable!() };
     let cleanup = || async { unreachable!() };
 
     let result = with_ref(path, setup, body, cleanup).await;
@@ -719,7 +853,7 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Ok(()) };
-    let body = || async { Err(anyhow!("body fail")) };
+    let body = |_is_first_user| async { Err(anyhow!("body fail")) };
     let cleanup = || async { Ok(()) };
 
     let result = with_ref(path, setup, body, cleanup).await;
@@ -735,7 +869,7 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Ok(()) };
-    let body = || async { Err(anyhow!("body fail")) };
+    let body = |_is_first_user| async { Err(anyhow!("body fail")) };
     let cleanup = || async { Err(anyhow!("cleanup fail")) };
 
     let result = with_ref(path, setup, body, cleanup).await;
@@ -750,7 +884,7 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Ok(()) };
-    let body = || async { Ok(()) };
+    let body = |_is_first_user| async { Ok(()) };
     let cleanup = || async { Err(anyhow!("cleanup fail")) };
 
     let result = with_ref(path, setup, body, cleanup).await;
