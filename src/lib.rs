@@ -586,7 +586,9 @@ where
   let args = match Args::try_parse_from(args) {
     Ok(args) => args,
     Err(err) => match err.kind() {
-      ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+      ErrorKind::DisplayVersion
+      | ErrorKind::DisplayHelp
+      | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
         print!("{}", err);
         return Ok(())
       },
@@ -767,6 +769,14 @@ mod tests {
   #[tokio::test]
   async fn help() {
     let args = [OsStr::new("chroot-deploy"), OsStr::new("--help")];
+    let () = run(args).await.unwrap();
+  }
+
+  /// Check that we do not error out when the user didn't provide any
+  /// arguments.
+  #[tokio::test]
+  async fn no_args() {
+    let args = [OsStr::new("chroot-deploy")];
     let () = run(args).await.unwrap();
   }
 }
