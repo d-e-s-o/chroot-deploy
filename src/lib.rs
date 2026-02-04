@@ -14,11 +14,11 @@ use std::fs;
 use std::future::ready;
 use std::future::Future;
 use std::io;
-use std::mem::size_of;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::process::id as process_id;
 use std::process::Stdio;
 use std::str;
 use std::str::FromStr as _;
@@ -139,59 +139,79 @@ impl Drop for FileLockGuard<'_> {
 }
 
 
-async fn read_ref_cnt(file: &mut FileLockGuard<'_>) -> Result<usize> {
+async fn read_pids(file: &mut FileLockGuard<'_>) -> Result<Vec<u32>> {
   let _offset = file.rewind().await?;
-  let mut buffer = [0u8; size_of::<usize>()];
-  let count = file.read(&mut buffer).await?;
-  if count == 0 {
-    Ok(0)
+  let mut buffer = Vec::new();
+  let _count = file.read_to_end(&mut buffer).await?;
+  if buffer.is_empty() {
+    Ok(Vec::new())
   } else {
-    let data = buffer.get(0..count).expect("read returned invalid count");
-    let data = str::from_utf8(data).context("reference count file data is not valid UTF-8")?;
-    let ref_cnt = usize::from_str(data)
-      .context("reference count file does not contain a valid reference count")?;
-    Ok(ref_cnt)
+    let data = str::from_utf8(&buffer).context("PID file data is not valid UTF-8")?;
+    let mut pids = data
+      .lines()
+      .filter(|line| !line.is_empty())
+      .map(|line| {
+        u32::from_str(line).with_context(|| format!("invalid PID in reference file: {line}"))
+      })
+      .collect::<Result<Vec<u32>>>()?;
+    pids.sort_unstable();
+    Ok(pids)
   }
 }
 
 
-async fn write_ref_cnt(file: &mut FileLockGuard<'_>, ref_cnt: usize) -> Result<()> {
+async fn write_pids(file: &mut FileLockGuard<'_>, pids: &[u32]) -> Result<()> {
   let _offset = file.rewind().await?;
-  let ref_cnt = ref_cnt.to_string();
-  let () = file
-    .write_all(ref_cnt.as_bytes())
+  file
+    .set_len(0)
     .await
-    .context("failed to write reference count")?;
+    .context("failed to truncate PID file")?;
+
+  let content = pids
+    .iter()
+    .map(|pid| pid.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+  let () = file
+    .write_all(content.as_bytes())
+    .await
+    .context("failed to write PIDs")?;
   Ok(())
 }
 
 
 /// # Returns
-/// This function returns a lock guard if the reference count is one, in
-/// which case callers may want to perform a one-time initialization.
-async fn inc_ref_cnt(ref_file: &mut File) -> Result<Option<FileLockGuard<'_>>> {
+/// This function returns a lock guard if the PID was added to an empty
+/// list, in which case callers may want to perform a one-time initialization.
+async fn add_pid(ref_file: &mut File, pid: u32) -> Result<Option<FileLockGuard<'_>>> {
   let mut guard = FileLockGuard::lock(ref_file).await?;
-  let ref_cnt = read_ref_cnt(&mut guard).await?;
-  let () = write_ref_cnt(&mut guard, ref_cnt + 1).await?;
-  let guard = if ref_cnt == 0 { Some(guard) } else { None };
+  let mut pids = read_pids(&mut guard).await?;
+  let was_empty = pids.is_empty();
+
+  if let Err(idx) = pids.binary_search(&pid) {
+    pids.insert(idx, pid);
+  }
+
+  let () = write_pids(&mut guard, &pids).await?;
+  let guard = if was_empty { Some(guard) } else { None };
   Ok(guard)
 }
 
 /// # Returns
-/// This function returns a lock guard if the reference count reached
-/// zero.
-async fn dec_ref_cnt(ref_file: &mut File) -> Result<Option<FileLockGuard<'_>>> {
+/// This function returns a lock guard if the PID list became empty after
+/// removal.
+async fn remove_pid(ref_file: &mut File, pid: u32) -> Result<Option<FileLockGuard<'_>>> {
   let mut guard = FileLockGuard::lock(ref_file).await?;
-  let ref_cnt = read_ref_cnt(&mut guard).await?;
-  let () = write_ref_cnt(
-    &mut guard,
-    ref_cnt
-      .checked_sub(1)
-      .expect("cannot decrease reference count of zero"),
-  )
-  .await?;
+  let mut pids = read_pids(&mut guard).await?;
 
-  let guard = if ref_cnt == 1 { Some(guard) } else { None };
+  if let Ok(idx) = pids.binary_search(&pid) {
+    pids.remove(idx);
+  } else {
+    panic!("cannot remove PID {pid} that is not in the reference list");
+  }
+
+  let () = write_pids(&mut guard, &pids).await?;
+  let guard = if pids.is_empty() { Some(guard) } else { None };
   Ok(guard)
 }
 
@@ -219,7 +239,8 @@ where
     .await
     .with_context(|| format!("failed to open `{}`", ref_path.display()))?;
 
-  let guard = inc_ref_cnt(&mut ref_file).await?;
+  let pid = process_id();
+  let guard = add_pid(&mut ref_file, pid).await?;
   if guard.is_some() {
     let setup_result = setup().await;
     let () = drop(guard);
@@ -227,7 +248,7 @@ where
     // NB: We never concluded the setup code so we do not invoke the
     //     cleanup on any of the error paths.
     if let Err(setup_err) = setup_result {
-      match dec_ref_cnt(&mut ref_file).await {
+      match remove_pid(&mut ref_file, pid).await {
         Ok(Some(_guard)) => {
           // We treat lock file removal as optional and ignore errors.
           let _result = remove_file(ref_path).await;
@@ -243,7 +264,7 @@ where
 
 
   let body_result = body().await;
-  let result = match dec_ref_cnt(&mut ref_file).await {
+  let result = match remove_pid(&mut ref_file, pid).await {
     Ok(Some(guard)) => {
       let cleanup_result = cleanup().await;
       // We treat lock file removal as optional and ignore errors.
@@ -253,10 +274,10 @@ where
     },
     Ok(None) => body_result,
     Err(inner_err) => {
-      // NB: If we fail to decrement the reference count it's not safe
-      //     to invoke any cleanup, because we have no idea how many
-      //     outstanding references there may be. All we can do is
-      //     short-circuit here.
+      // NB: If we fail to remove our PID it's not safe to invoke any
+      //     cleanup, because we have no idea how many outstanding
+      //     references there may be. All we can do is short-circuit
+      //     here.
       body_result.map_err(|err| err.context(inner_err))
     },
   };
@@ -622,57 +643,73 @@ mod tests {
     assert_eq!(stem, OsStr::new("stage3-amd64-openrc-20240211T161834Z"));
   }
 
-  /// Check that we can increment the reference count of a file.
+  /// Check that we can add a PID to a file.
   #[tokio::test]
-  async fn lock_file_ref_cnt_inc() {
+  async fn lock_file_add_pid() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let mut guard = inc_ref_cnt(&mut file).await.unwrap().unwrap();
-    let ref_cnt = read_ref_cnt(&mut guard).await.unwrap();
-    assert_eq!(ref_cnt, 1);
+    let mut guard = add_pid(&mut file, 1234).await.unwrap().unwrap();
+    let pids = read_pids(&mut guard).await.unwrap();
+    assert_eq!(pids, vec![1234]);
   }
 
-  /// Check that we can increment the reference count of a file multiple
-  /// times.
+  /// Check that we can add multiple PIDs to a file.
   #[tokio::test]
-  async fn lock_file_ref_cnt_inc_multi() {
+  async fn lock_file_add_pid_multi() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let guard = inc_ref_cnt(&mut file).await.unwrap();
+    let guard = add_pid(&mut file, 1000).await.unwrap();
     assert!(guard.is_some());
     drop(guard);
 
-    let guard = inc_ref_cnt(&mut file).await.unwrap();
+    let guard = add_pid(&mut file, 2000).await.unwrap();
     assert!(guard.is_none());
     drop(guard);
 
-    let guard = inc_ref_cnt(&mut file).await.unwrap();
+    let guard = add_pid(&mut file, 3000).await.unwrap();
     assert!(guard.is_none());
     drop(guard);
 
-    let guard = dec_ref_cnt(&mut file).await.unwrap();
+    let guard = remove_pid(&mut file, 2000).await.unwrap();
     assert!(guard.is_none());
     drop(guard);
 
-    let guard = dec_ref_cnt(&mut file).await.unwrap();
+    let guard = remove_pid(&mut file, 1000).await.unwrap();
     assert!(guard.is_none());
     drop(guard);
 
-    let guard = dec_ref_cnt(&mut file).await.unwrap();
+    let guard = remove_pid(&mut file, 3000).await.unwrap();
     assert!(guard.is_some());
   }
 
-  /// Check that we can decrement the reference count of a file.
+  /// Check that we can remove a PID from a file.
   #[tokio::test]
-  async fn lock_file_ref_cnt_dec() {
+  async fn lock_file_remove_pid() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let guard = inc_ref_cnt(&mut file).await.unwrap().unwrap();
+    let guard = add_pid(&mut file, 1234).await.unwrap().unwrap();
     let file = guard.unlock().unwrap();
 
-    let mut guard = dec_ref_cnt(file).await.unwrap().unwrap();
-    let ref_cnt = read_ref_cnt(&mut guard).await.unwrap();
-    assert_eq!(ref_cnt, 0);
+    let mut guard = remove_pid(file, 1234).await.unwrap().unwrap();
+    let pids = read_pids(&mut guard).await.unwrap();
+    assert!(pids.is_empty());
+  }
+
+  /// Check that PIDs are stored sorted.
+  #[tokio::test]
+  async fn lock_file_pids_sorted() {
+    let mut file = File::from_std(tempfile().unwrap());
+
+    let guard = add_pid(&mut file, 3000).await.unwrap();
+    drop(guard);
+    let guard = add_pid(&mut file, 1000).await.unwrap();
+    drop(guard);
+    let guard = add_pid(&mut file, 2000).await.unwrap();
+    drop(guard);
+
+    let mut guard = FileLockGuard::lock(&mut file).await.unwrap();
+    let pids = read_pids(&mut guard).await.unwrap();
+    assert_eq!(pids, vec![1000, 2000, 3000]);
   }
 
   /// Check that file locking ensures mutual exclusion as expected.
@@ -682,15 +719,25 @@ mod tests {
     // lock a single `File` instance multiple times. So we open the file
     // multiple times by path instead.
     let file = NamedTempFile::new().unwrap();
-    let mut file1 = File::open(file.path()).await.unwrap();
-    let _guard1 = inc_ref_cnt(&mut file1).await.unwrap().unwrap();
+    let mut file1 = File::options()
+      .read(true)
+      .write(true)
+      .open(file.path())
+      .await
+      .unwrap();
+    let _guard1 = add_pid(&mut file1, 1000).await.unwrap().unwrap();
 
-    let mut file2 = File::open(file.path()).await.unwrap();
-    let inc = inc_ref_cnt(&mut file2);
+    let mut file2 = File::options()
+      .read(true)
+      .write(true)
+      .open(file.path())
+      .await
+      .unwrap();
+    let add = add_pid(&mut file2, 2000);
     let timeout = sleep(Duration::from_millis(10));
 
     select! {
-      result = inc => panic!("should not be able to increment reference count but got: {result:?}"),
+      result = add => panic!("should not be able to add PID but got: {result:?}"),
       () = timeout => (),
     }
   }
