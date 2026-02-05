@@ -20,6 +20,7 @@ use std::path::Path;
 use std::process;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::ptr;
 use std::str::FromStr as _;
 use std::time::Duration;
 
@@ -182,22 +183,32 @@ async fn write_pids(file: &mut FileLockGuard<'_>, pids: &[u32]) -> Result<()> {
 }
 
 
-/// # Returns
-/// This function returns a lock guard if the PID was added to an empty
-/// list, in which case callers may want to perform a one-time
-/// initialization.
-async fn add_pid(ref_file: &mut File, pid: u32) -> Result<Option<FileLockGuard<'_>>> {
+/// Result of adding a PID to the reference file.
+#[derive(Debug)]
+enum AddPidResult<'file> {
+  /// Caller owns the PID file and holds the lock for setup.
+  #[allow(dead_code)]
+  OwnPid(FileLockGuard<'file>),
+  /// Caller should join the namespace of an existing process with this
+  /// PID.
+  ExistingPid(u32),
+}
+
+async fn add_pid(ref_file: &mut File, pid: u32) -> Result<AddPidResult<'_>> {
   let mut guard = FileLockGuard::lock(ref_file).await?;
   let mut pids = read_pids(&mut guard).await?;
-  let was_empty = pids.is_empty();
+  let first_pid = pids.first().copied();
 
   if let Err(idx) = pids.binary_search(&pid) {
     let () = pids.insert(idx, pid);
   }
 
   let () = write_pids(&mut guard, &pids).await?;
-  let guard = if was_empty { Some(guard) } else { None };
-  Ok(guard)
+  if let Some(pid) = first_pid {
+    Ok(AddPidResult::ExistingPid(pid))
+  } else {
+    Ok(AddPidResult::OwnPid(guard))
+  }
 }
 
 /// # Returns
@@ -231,9 +242,9 @@ async fn with_ref<S, FutS, B, FutB, C, FutC>(
 where
   S: FnOnce() -> FutS,
   FutS: Future<Output = Result<()>>,
-  B: FnOnce() -> FutB,
+  B: FnOnce(Option<u32>) -> FutB,
   FutB: Future<Output = Result<()>>,
-  C: FnOnce() -> FutC,
+  C: FnOnce(bool) -> FutC,
   FutC: Future<Output = Result<()>>,
 {
   let mut ref_file = File::options()
@@ -246,10 +257,15 @@ where
     .with_context(|| format!("failed to open `{}`", ref_path.display()))?;
 
   let pid = process::id();
-  let guard = add_pid(&mut ref_file, pid).await?;
-  if guard.is_some() {
+  let add_result = add_pid(&mut ref_file, pid).await?;
+  let (is_first_user, ns_pid) = match &add_result {
+    AddPidResult::OwnPid(_) => (true, None),
+    AddPidResult::ExistingPid(pid) => (false, Some(*pid)),
+  };
+
+  if is_first_user {
     let setup_result = setup().await;
-    let () = drop(guard);
+    let () = drop(add_result);
 
     // NB: We never concluded the setup code so we do not invoke the
     //     cleanup on any of the error paths.
@@ -265,14 +281,14 @@ where
       }
     }
   } else {
-    let () = drop(guard);
+    let () = drop(add_result);
   }
 
 
-  let body_result = body().await;
+  let body_result = body(ns_pid).await;
   let result = match remove_pid(&mut ref_file, pid).await {
     Ok(Some(guard)) => {
-      let cleanup_result = cleanup().await;
+      let cleanup_result = cleanup(is_first_user).await;
       // We treat lock file removal as optional and ignore errors.
       let _result = remove_file(ref_path).await;
       let () = drop(guard);
@@ -433,7 +449,40 @@ where
 }
 
 
+/// Create a new mount namespace for the current process.
+///
+/// This function calls `unshare(CLONE_NEWNS)` to create a new mount
+/// namespace and sets the root mount propagation to private to prevent
+/// mount events from leaking to the host.
+fn create_namespace() -> Result<()> {
+  // Create new mount namespace (process-wide)
+  let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+  if rc != 0 {
+    return Err(io::Error::last_os_error()).context("failed to create mount namespace");
+  }
+
+  // Set propagation to private (prevent mount events leaking to host).
+  let rc = unsafe {
+    libc::mount(
+      ptr::null(),
+      c"/".as_ptr(),
+      ptr::null(),
+      libc::MS_REC | libc::MS_PRIVATE,
+      ptr::null(),
+    )
+  };
+  if rc != 0 {
+    return Err(io::Error::last_os_error()).context("failed to set mount propagation to private");
+  }
+
+  Ok(())
+}
+
+
 async fn setup_chroot(archive: &Path, chroot: &Path) -> Result<()> {
+  // Create mount namespace first (before any mounts).
+  let () = create_namespace()?;
+
   let present = try_exists(chroot)
     .await
     .with_context(|| format!("failed to check existence of `{}`", chroot.display()))?;
@@ -507,17 +556,21 @@ async fn setup_chroot(archive: &Path, chroot: &Path) -> Result<()> {
   Ok(())
 }
 
-async fn chroot(chroot: &Path, command: Option<&[OsString]>, user: Option<&OsStr>) -> Result<()> {
-  let args = [
+async fn chroot(
+  chroot_dir: &Path,
+  ns_pid: Option<u32>,
+  command: Option<&[OsString]>,
+  user: Option<&OsStr>,
+) -> Result<()> {
+  let su_args = [
     OsStr::new("/bin/su"),
     OsStr::new("--login"),
     user.unwrap_or_else(|| OsStr::new("root")),
   ];
-  let args = args.as_slice();
+  let su_args = su_args.as_slice();
 
-  let command = if let Some(command) = command {
-    let mut iter = command.iter();
-    format_command(iter.next().context("no command given")?, iter)
+  let session_command = if let Some([cmd, args @ ..]) = command {
+    format_command(cmd, args)
   } else {
     let args = [
       r#"PS1="(chroot) \[\033[01;32m\]\u@\h\[\033[01;34m\] \w \$\[\033[00m\] ""#,
@@ -528,47 +581,86 @@ async fn chroot(chroot: &Path, command: Option<&[OsString]>, user: Option<&OsStr
     format_command("/bin/env", args)
   };
 
-  let () = check_command(
-    "chroot",
-    [chroot.as_os_str()]
-      .as_slice()
-      .iter()
-      .chain(args)
-      .chain([OsStr::new("--session-command"), OsStr::new(&command)].as_slice()),
-  )
-  .await?;
+  if let Some(pid) = ns_pid {
+    // Join namespace of the first process using `nsenter`.
+    let target_arg = format!("--target={pid}");
+
+    let () = check_command(
+      "nsenter",
+      [
+        OsStr::new(&target_arg),
+        OsStr::new("--mount"),
+        OsStr::new("--"),
+      ]
+      .into_iter()
+      .chain(
+        [OsStr::new("chroot"), chroot_dir.as_os_str()]
+          .into_iter()
+          .chain(su_args.iter().copied())
+          .chain([
+            OsStr::new("--session-command"),
+            OsStr::new(&session_command),
+          ]),
+      ),
+    )
+    .await?;
+  } else {
+    // Already in namespace from setup phase, run `chroot` directly.
+    let () = check_command(
+      "chroot",
+      [chroot_dir.as_os_str()]
+        .as_slice()
+        .iter()
+        .chain(su_args)
+        .chain(
+          [
+            OsStr::new("--session-command"),
+            OsStr::new(&session_command),
+          ]
+          .as_slice(),
+        ),
+    )
+    .await?;
+  }
   Ok(())
 }
 
-async fn cleanup_chroot(chroot: &Path, remove: bool) -> Result<()> {
-  let run = run_command("umount", [chroot.join("run")]);
-  let tmp = run_command("umount", [chroot.join("tmp")]);
-  let repos = run_command("umount", [chroot.join("var").join("db").join("repos")]);
-  let proc = run_command("umount", [chroot.join("proc")]);
-  let sys = run_command(
-    "umount",
-    [
-      OsString::from("--recursive"),
-      chroot.join("sys").into_os_string(),
-    ],
-  );
-  let dev = run_command(
-    "umount",
-    [
-      OsString::from("--recursive"),
-      chroot.join("dev").into_os_string(),
-    ],
-  );
+async fn cleanup_chroot(chroot: &Path, is_first_user: bool, remove: bool) -> Result<()> {
+  // Only unmount if we're the first user (i.e., our process is in the
+  // namespace). Non-first users only had their `nsenter` child process
+  // enter the namespace temporarily; their main process (running this
+  // cleanup code) remains in the host namespace where these mounts are
+  // not visible.
+  if is_first_user {
+    let run = run_command("umount", [chroot.join("run")]);
+    let tmp = run_command("umount", [chroot.join("tmp")]);
+    let repos = run_command("umount", [chroot.join("var").join("db").join("repos")]);
+    let proc = run_command("umount", [chroot.join("proc")]);
+    let sys = run_command(
+      "umount",
+      [
+        OsString::from("--recursive"),
+        chroot.join("sys").into_os_string(),
+      ],
+    );
+    let dev = run_command(
+      "umount",
+      [
+        OsString::from("--recursive"),
+        chroot.join("dev").into_os_string(),
+      ],
+    );
 
-  let results = join!(dev, sys, repos, tmp, run);
-  // There exists some kind of a dependency causing the `proc` unmount
-  // to occasionally fail when run in parallel to the others. So make
-  // sure to run it strictly afterwards.
-  let result = proc.await;
-  let () = <[_; 5]>::from(results)
-    .into_iter()
-    .chain([result])
-    .try_for_each(|result| result)?;
+    let results = join!(dev, sys, repos, tmp, run);
+    // There exists some kind of a dependency causing the `proc` unmount
+    // to occasionally fail when run in parallel to the others. So make
+    // sure to run it strictly afterwards.
+    let result = proc.await;
+    let () = <[_; 5]>::from(results)
+      .into_iter()
+      .chain([result])
+      .try_for_each(|result| result)?;
+  }
 
   if remove {
     let () = remove_dir_all(chroot).await?;
@@ -597,8 +689,8 @@ async fn deploy(deploy: Deploy) -> Result<()> {
   let ref_path = tmp.join(stem).with_extension("lck");
 
   let setup = || setup_chroot(&archive, &chroot_dir);
-  let chroot = || chroot(&chroot_dir, command.as_deref(), user.as_deref());
-  let cleanup = || cleanup_chroot(&chroot_dir, remove);
+  let chroot = |ns_pid| chroot(&chroot_dir, ns_pid, command.as_deref(), user.as_deref());
+  let cleanup = |is_first_user| cleanup_chroot(&chroot_dir, is_first_user, remove);
 
   with_ref(&ref_path, setup, chroot, cleanup).await
 }
@@ -656,7 +748,9 @@ mod tests {
   async fn lock_file_add_pid() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let mut guard = add_pid(&mut file, 1234).await.unwrap().unwrap();
+    let AddPidResult::OwnPid(mut guard) = add_pid(&mut file, 1234).await.unwrap() else {
+      panic!("expected OwnPid");
+    };
     let pids = read_pids(&mut guard).await.unwrap();
     assert_eq!(pids, vec![1234]);
   }
@@ -666,17 +760,17 @@ mod tests {
   async fn lock_file_add_pid_multi() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let guard = add_pid(&mut file, 1000).await.unwrap();
-    assert!(guard.is_some());
-    drop(guard);
+    let result = add_pid(&mut file, 1000).await.unwrap();
+    assert!(matches!(result, AddPidResult::OwnPid(_)));
+    drop(result);
 
-    let guard = add_pid(&mut file, 2000).await.unwrap();
-    assert!(guard.is_none());
-    drop(guard);
+    let result = add_pid(&mut file, 2000).await.unwrap();
+    assert!(matches!(result, AddPidResult::ExistingPid(1000)));
+    drop(result);
 
-    let guard = add_pid(&mut file, 3000).await.unwrap();
-    assert!(guard.is_none());
-    drop(guard);
+    let result = add_pid(&mut file, 3000).await.unwrap();
+    assert!(matches!(result, AddPidResult::ExistingPid(1000)));
+    drop(result);
 
     let guard = remove_pid(&mut file, 2000).await.unwrap();
     assert!(guard.is_none());
@@ -695,7 +789,9 @@ mod tests {
   async fn lock_file_remove_pid() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let guard = add_pid(&mut file, 1234).await.unwrap().unwrap();
+    let AddPidResult::OwnPid(guard) = add_pid(&mut file, 1234).await.unwrap() else {
+      panic!("expected OwnPid");
+    };
     let file = guard.unlock().unwrap();
 
     let mut guard = remove_pid(file, 1234).await.unwrap().unwrap();
@@ -708,12 +804,12 @@ mod tests {
   async fn lock_file_pids_sorted() {
     let mut file = File::from_std(tempfile().unwrap());
 
-    let guard = add_pid(&mut file, 3000).await.unwrap();
-    drop(guard);
-    let guard = add_pid(&mut file, 1000).await.unwrap();
-    drop(guard);
-    let guard = add_pid(&mut file, 2000).await.unwrap();
-    drop(guard);
+    let result = add_pid(&mut file, 3000).await.unwrap();
+    drop(result);
+    let result = add_pid(&mut file, 1000).await.unwrap();
+    drop(result);
+    let result = add_pid(&mut file, 2000).await.unwrap();
+    drop(result);
 
     let mut guard = FileLockGuard::lock(&mut file).await.unwrap();
     let pids = read_pids(&mut guard).await.unwrap();
@@ -733,7 +829,9 @@ mod tests {
       .open(file.path())
       .await
       .unwrap();
-    let _guard1 = add_pid(&mut file1, 1000).await.unwrap().unwrap();
+    let AddPidResult::OwnPid(_guard1) = add_pid(&mut file1, 1000).await.unwrap() else {
+      panic!("expected OwnPid");
+    };
 
     let mut file2 = File::options()
       .read(true)
@@ -757,8 +855,8 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Err(anyhow!("setup fail")) };
-    let body = || async { unreachable!() };
-    let cleanup = || async { unreachable!() };
+    let body = |_ns_pid| async { unreachable!() };
+    let cleanup = |_is_first_user| async { unreachable!() };
 
     let result = with_ref(path, setup, body, cleanup).await;
     assert_eq!(result.unwrap_err().to_string(), "setup fail");
@@ -772,8 +870,8 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Ok(()) };
-    let body = || async { Err(anyhow!("body fail")) };
-    let cleanup = || async { Ok(()) };
+    let body = |_ns_pid| async { Err(anyhow!("body fail")) };
+    let cleanup = |_is_first_user| async { Ok(()) };
 
     let result = with_ref(path, setup, body, cleanup).await;
     assert_eq!(result.unwrap_err().to_string(), "body fail");
@@ -788,8 +886,8 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Ok(()) };
-    let body = || async { Err(anyhow!("body fail")) };
-    let cleanup = || async { Err(anyhow!("cleanup fail")) };
+    let body = |_ns_pid| async { Err(anyhow!("body fail")) };
+    let cleanup = |_is_first_user| async { Err(anyhow!("cleanup fail")) };
 
     let result = with_ref(path, setup, body, cleanup).await;
     assert_eq!(result.unwrap_err().to_string(), "body fail");
@@ -803,8 +901,8 @@ mod tests {
     let path = file.path();
 
     let setup = || async { Ok(()) };
-    let body = || async { Ok(()) };
-    let cleanup = || async { Err(anyhow!("cleanup fail")) };
+    let body = |_ns_pid| async { Ok(()) };
+    let cleanup = |_is_first_user| async { Err(anyhow!("cleanup fail")) };
 
     let result = with_ref(path, setup, body, cleanup).await;
     assert_eq!(result.unwrap_err().to_string(), "cleanup fail");
