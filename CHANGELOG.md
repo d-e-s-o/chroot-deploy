@@ -1,3 +1,8 @@
+Unreleased
+----------
+- Adjusted `chroot` logic to use private mount namespace
+
+
 0.1.1
 -----
 - Remove all package file extensions when inferring deploy directory
