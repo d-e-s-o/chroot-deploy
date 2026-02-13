@@ -1,5 +1,5 @@
-Unreleased
-----------
+0.1.2
+-----
 - Adjusted `chroot` logic to use private mount namespace
 - Adjusted extraction logic to preserve ownership & permissions
 
