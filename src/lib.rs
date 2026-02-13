@@ -323,6 +323,8 @@ async fn unpack_compressed_tar(archive: &Path, dst: &Path) -> Result<()> {
     let decoder = XzDecoder::new_multi_decoder(file);
     let mut extracter = Archive::new(decoder);
     let () = extracter.set_overwrite(true);
+    let () = extracter.set_preserve_ownerships(true);
+    let () = extracter.set_preserve_permissions(true);
     let () = extracter.unpack(dst).context("failed to unpack archive")?;
     Ok(())
   })
